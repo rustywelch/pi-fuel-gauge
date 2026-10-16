@@ -29,18 +29,30 @@ const DEFAULT_RESERVE_TOKENS = 16384;
 const WARN_PERCENT = 70;
 const CRITICAL_PERCENT = 90;
 
+interface CompactionInfo {
+	enabled: boolean;
+	reserveTokens: number;
+}
+
 // Same lookup order Pi documents: model override, then the ordinary setting, then the default.
-function reserveTokensFor(modelKey: string | null): number {
+function getCompactionInfo(modelKey: string | null, window: number): CompactionInfo {
 	try {
 		const settings = JSON.parse(readFileSync(join(homedir(), ".pi/agent/settings.json"), "utf8"));
 		const compaction = settings?.compaction ?? {};
+		const enabled = compaction.enabled !== false;
 		const override = modelKey ? compaction.modelOverrides?.[modelKey]?.reserveTokens : undefined;
-		if (Number.isSafeInteger(override) && override >= 0) return override;
-		if (Number.isSafeInteger(compaction.reserveTokens) && compaction.reserveTokens >= 0) return compaction.reserveTokens;
+		let reserve = DEFAULT_RESERVE_TOKENS;
+		if (Number.isSafeInteger(override) && override >= 0) {
+			reserve = override;
+		} else if (Number.isSafeInteger(compaction.reserveTokens) && compaction.reserveTokens >= 0) {
+			reserve = compaction.reserveTokens;
+		}
+		// If reserveTokens is equal to or greater than the window, auto-compaction can never trigger
+		const effectivelyEnabled = enabled && reserve < window;
+		return { enabled: effectivelyEnabled, reserveTokens: reserve };
 	} catch {
-		// Unreadable settings fall through to Pi's built-in default.
+		return { enabled: true, reserveTokens: DEFAULT_RESERVE_TOKENS };
 	}
-	return DEFAULT_RESERVE_TOKENS;
 }
 
 function fmt(n: number): string {
@@ -59,10 +71,24 @@ function buildNote(ctx: ExtensionContext): string | null {
 
 	const used = usage.tokens;
 	const percent = usage.percent ?? (used / window) * 100;
-	const untilCompaction = Math.max(0, window - reserveTokensFor(modelKey) - used);
+	const compaction = getCompactionInfo(modelKey, window);
+
+	let compactionNote: string;
+	if (compaction.enabled) {
+		const untilCompaction = Math.max(0, window - compaction.reserveTokens - used);
+		compactionNote = `About ${fmt(untilCompaction)} tokens until Pi auto-compacts and summarizes older turns.`;
+	} else {
+		const warnThreshold = Math.round((window * WARN_PERCENT) / 100);
+		const untilWarn = Math.max(0, warnThreshold - used);
+		compactionNote =
+			percent >= WARN_PERCENT
+				? "Auto-compaction is disabled. Self-compaction is now allowed."
+				: `Auto-compaction is disabled. About ${fmt(untilWarn)} tokens until self-compaction is allowed (${WARN_PERCENT}%).`;
+	}
+
 	const lines = [
 		`[Context status] ${fmt(used)} / ${fmt(window)} tokens used (${percent.toFixed(1)}%). ` +
-			`About ${fmt(untilCompaction)} tokens until Pi auto-compacts and summarizes older turns. ` +
+			`${compactionNote} ` +
 			`This figure is from the last reply and may not yet count the newest tool results.`,
 	];
 	if (percent >= CRITICAL_PERCENT) {
