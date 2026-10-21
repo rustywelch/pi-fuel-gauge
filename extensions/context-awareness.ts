@@ -108,8 +108,9 @@ function buildNote(ctx: ExtensionContext): string | null {
 
 // ---- Self-compaction -------------------------------------------------------------------------
 //
-// compact_now queues Pi's own compaction (the agent must be idle, so it runs as soon as this turn
-// ends) and, when it completes, sends one resume message so the model continues without you.
+// compact_now requests Pi's own compaction from a model tool call. Pi ignores ctx.compact() while
+// the agent is busy, so the request is held until agent_before_settle, the first idle-safe boundary.
+// When compaction completes, one resume message continues the model without operator intervention.
 // Guards: a minimum fill level, a cooldown until context grows again, and a per-session cap on
 // automatic resumes so it can never loop.
 
@@ -117,7 +118,14 @@ const MIN_COMPACT_PERCENT = Number(process.env.PI_COMPACT_MIN_PERCENT ?? PREPARE
 const COOLDOWN_PERCENT_POINTS = 20;
 const MAX_AUTO_RESUMES = 5;
 
+interface PendingCompaction {
+	keep: string;
+	nextStep: string;
+	autoResume: boolean;
+}
+
 let compacting = false;
+let pendingCompaction: PendingCompaction | null = null;
 let autoResumes = 0;
 let percentAfterLastCompaction: number | null = null;
 
@@ -183,8 +191,21 @@ export default function contextAwareness(pi: ExtensionAPI): void {
 	// Guards are per session; a new or switched session starts clean.
 	pi.on("session_start", async () => {
 		compacting = false;
+		pendingCompaction = null;
 		autoResumes = 0;
 		percentAfterLastCompaction = null;
+	});
+
+	// A model-called tool executes while Pi is busy. Defer ctx.compact() until this idle-safe
+	// lifecycle boundary; returning continue: false lets compaction run instead of starting another
+	// provider turn. The slash command runs while idle and can call startCompaction directly.
+	pi.on("agent_before_settle", (_event, ctx) => {
+		const request = pendingCompaction;
+		if (!request) return;
+		pendingCompaction = null;
+		compacting = false;
+		startCompaction(pi, ctx, request.keep, request.nextStep, request.autoResume);
+		return { continue: false };
 	});
 
 	pi.on("context", async (event, ctx) => {
@@ -241,10 +262,12 @@ export default function contextAwareness(pi: ExtensionAPI): void {
 			if (!allowed.ok) {
 				return { content: [{ type: "text" as const, text: `Not compacting: ${allowed.reason} Keep working.` }], details: undefined };
 			}
-			// Fire-and-forget: compaction needs the agent idle and runs right after this turn ends.
-			startCompaction(pi, ctx, params.keep, params.next_step, true);
+			// ctx.compact() is ignored while an agent turn is active. Hold the request until
+			// agent_before_settle, when Pi is idle enough to accept it.
+			compacting = true;
+			pendingCompaction = { keep: params.keep, nextStep: params.next_step, autoResume: true };
 			return {
-				content: [{ type: "text" as const, text: "Compaction queued. Stop here; you will be resumed with your next step." }],
+				content: [{ type: "text" as const, text: "Compaction queued for the idle boundary. Stop here; you will be resumed with your next step." }],
 				details: undefined,
 				terminate: true,
 			};
