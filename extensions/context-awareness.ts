@@ -12,10 +12,11 @@
  * Also registers `context_status` so the model can check on demand, and a `/context-note`
  * command that shows the note the model would see next.
  *
- * Self-compaction: from 70% full the note says to finish the current task and compact at that clean boundary, and the
- * `compact_now` tool queues Pi's own compaction with keep/next-step instructions, ends the turn,
- * and resumes the model automatically when compaction finishes. `/compact-now` does the same for
- * you, without the automatic resume. PI_COMPACT_MIN_PERCENT overrides the 70% floor for testing.
+ * Self-compaction: from 75% full the note says to finish the current task and compact at that clean boundary.
+ * At 80%, it requires immediate compaction even when work is unfinished, preserving that work in the keep and
+ * next-step instructions. The `compact_now` tool queues Pi's own compaction, ends the turn, and resumes the model
+ * automatically when compaction finishes. `/compact-now` does the same for you, without the automatic resume.
+ * PI_COMPACT_MIN_PERCENT overrides the 75% floor for testing.
  */
 
 import { readFileSync } from "node:fs";
@@ -23,35 +24,17 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { defaultCompactionInfo, resolveCompactionInfo } from "../lib/compaction-info.mjs";
+import { contextPolicy, HARD_COMPACT_PERCENT, PREPARE_PERCENT } from "../lib/context-policy.mjs";
 import { captureWorkspaceCheckpoint, resumeVerification } from "../lib/context-checkpoint.mjs";
 
-const DEFAULT_RESERVE_TOKENS = 16384;
-const WARN_PERCENT = 70;
-const CRITICAL_PERCENT = 90;
-
-interface CompactionInfo {
-	enabled: boolean;
-	reserveTokens: number;
-}
-
 // Same lookup order Pi documents: model override, then the ordinary setting, then the default.
-function getCompactionInfo(modelKey: string | null, window: number): CompactionInfo {
+function getCompactionInfo(modelKey: string | null, window: number) {
 	try {
 		const settings = JSON.parse(readFileSync(join(homedir(), ".pi/agent/settings.json"), "utf8"));
-		const compaction = settings?.compaction ?? {};
-		const enabled = compaction.enabled !== false;
-		const override = modelKey ? compaction.modelOverrides?.[modelKey]?.reserveTokens : undefined;
-		let reserve = DEFAULT_RESERVE_TOKENS;
-		if (Number.isSafeInteger(override) && override >= 0) {
-			reserve = override;
-		} else if (Number.isSafeInteger(compaction.reserveTokens) && compaction.reserveTokens >= 0) {
-			reserve = compaction.reserveTokens;
-		}
-		// If reserveTokens is equal to or greater than the window, auto-compaction can never trigger
-		const effectivelyEnabled = enabled && reserve < window;
-		return { enabled: effectivelyEnabled, reserveTokens: reserve };
+		return resolveCompactionInfo(settings, modelKey, window);
 	} catch {
-		return { enabled: true, reserveTokens: DEFAULT_RESERVE_TOKENS };
+		return defaultCompactionInfo(window);
 	}
 }
 
@@ -72,18 +55,19 @@ function buildNote(ctx: ExtensionContext): string | null {
 	const used = usage.tokens;
 	const percent = usage.percent ?? (used / window) * 100;
 	const compaction = getCompactionInfo(modelKey, window);
+	const policy = contextPolicy(percent);
 
 	let compactionNote: string;
 	if (compaction.enabled) {
 		const untilCompaction = Math.max(0, window - compaction.reserveTokens - used);
 		compactionNote = `About ${fmt(untilCompaction)} tokens until Pi auto-compacts and summarizes older turns.`;
 	} else {
-		const warnThreshold = Math.round((window * WARN_PERCENT) / 100);
+		const warnThreshold = Math.round((window * PREPARE_PERCENT) / 100);
 		const untilWarn = Math.max(0, warnThreshold - used);
 		compactionNote =
-			percent >= WARN_PERCENT
+			percent >= PREPARE_PERCENT
 				? "Auto-compaction is disabled. Self-compaction is now allowed."
-				: `Auto-compaction is disabled. About ${fmt(untilWarn)} tokens until self-compaction is allowed (${WARN_PERCENT}%).`;
+				: `Auto-compaction is disabled. About ${fmt(untilWarn)} tokens until self-compaction is allowed (${PREPARE_PERCENT}%).`;
 	}
 
 	const lines = [
@@ -91,21 +75,27 @@ function buildNote(ctx: ExtensionContext): string | null {
 			`${compactionNote} ` +
 			`This figure is from the last reply and may not yet count the newest tool results.`,
 	];
-	if (percent >= CRITICAL_PERCENT) {
+	if (policy.phase === "hard") {
 		lines.push(
-			"Context is nearly full. Finish the current step, write durable results to files now, and avoid large reads.",
+			`Hard compaction limit reached (${HARD_COMPACT_PERCENT}%). Stop normal work and compact immediately. ` +
+				"Do not make another tool call first; preserve unfinished work in the compaction keep and next-step fields.",
 		);
-	} else if (percent >= WARN_PERCENT) {
+	} else if (policy.phase === "prepare") {
 		lines.push(
 			"Context is getting full. Start wrapping up: finish the current task, keep reads targeted (line ranges, grep), " +
 				"and save important findings to files. Then compact at that clean boundary (see below).",
 		);
 	} else {
 		lines.push(
-			`Plenty of room. Keep working normally; do not wrap up early or try to compact before ${WARN_PERCENT}%.`,
+			`Plenty of room. Keep working normally; do not wrap up early or try to compact before ${PREPARE_PERCENT}%.`,
 		);
 	}
-	if (percent >= PRIME_PERCENT && compactAllowedNow(used, window).ok) {
+	if (policy.phase === "hard" && compactAllowedNow(used, window).ok) {
+		lines.push(
+			"Call compact_now now, even if the task is unfinished. Put the exact unfinished state in keep and the immediate " +
+				"continuation action in next_step. Stop after that tool call; the session will resume automatically.",
+		);
+	} else if (policy.phase === "prepare" && compactAllowedNow(used, window).ok) {
 		lines.push(
 			"Compaction is now allowed. Compact ONLY if ALL of these are true: the current task is finished, tests are green, " +
 				"notes or handoff files are saved, and nothing is half-edited. If any is false, keep working and do not call " +
@@ -123,8 +113,7 @@ function buildNote(ctx: ExtensionContext): string | null {
 // Guards: a minimum fill level, a cooldown until context grows again, and a per-session cap on
 // automatic resumes so it can never loop.
 
-const PRIME_PERCENT = WARN_PERCENT;
-const MIN_COMPACT_PERCENT = Number(process.env.PI_COMPACT_MIN_PERCENT ?? WARN_PERCENT);
+const MIN_COMPACT_PERCENT = Number(process.env.PI_COMPACT_MIN_PERCENT ?? PREPARE_PERCENT);
 const COOLDOWN_PERCENT_POINTS = 20;
 const MAX_AUTO_RESUMES = 5;
 
@@ -137,9 +126,13 @@ function compactAllowedNow(used: number, window: number): { ok: boolean; reason?
 	if (compacting) return { ok: false, reason: "A compaction is already queued or running." };
 	if (autoResumes >= MAX_AUTO_RESUMES)
 		return { ok: false, reason: `Self-compaction limit reached for this session (${MAX_AUTO_RESUMES}).` };
-	if (percent < MIN_COMPACT_PERCENT)
+	if (percent < MIN_COMPACT_PERCENT && percent < HARD_COMPACT_PERCENT)
 		return { ok: false, reason: `Context is only ${percent.toFixed(1)}% full; compact at ${MIN_COMPACT_PERCENT}% or more.` };
-	if (percentAfterLastCompaction !== null && percent < percentAfterLastCompaction + COOLDOWN_PERCENT_POINTS)
+	if (
+		percent < HARD_COMPACT_PERCENT &&
+		percentAfterLastCompaction !== null &&
+		percent < percentAfterLastCompaction + COOLDOWN_PERCENT_POINTS
+	)
 		return { ok: false, reason: "Context has not grown enough since the last compaction." };
 	return { ok: true };
 }
