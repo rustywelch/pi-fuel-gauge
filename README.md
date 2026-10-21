@@ -74,6 +74,26 @@ look, act, look again.
 
 Coordinates are device points, origin top-left. You need an installed iOS runtime (`xcodebuild -downloadPlatform iOS`).
 
+## repo-state
+
+One `repo_state` tool that inventories every Git checkout under a root directory (default: the working directory) in one
+table, so you can see what is dirty, what is behind its remote, and which plain copies exist. It exists for a `~/Dev` with
+~90 entries: real repositories, purpose-built worktrees (`corti-platform-cadfix2`, `worktrees/`), and untracked copies that
+session hygiene forbids keeping. Directory names never decide: each directory is probed with `git rev-parse`, then read with
+cheap porcelain commands (`git status --porcelain=v2 -b`, `git log -1`, `git worktree list --porcelain`, `git branch --merged`).
+
+- **Fixed-width table**: repo, branch, ahead, behind, dirty count, last commit, updated date, and a state (`clean`, `dirty`,
+  `behind`, `ahead`, `diverged`, `detached`, `no-remote`, `error`), plus a summary line with the counts per state.
+- **Parameters:** `root` (directory to scan), `fetch` (run `git fetch` first so ahead/behind is current; off by default),
+  `group` (only repos whose name starts with a prefix, for example `corti`), `detail` (add the worktree list and merged-branch
+  hints per repo).
+- **Duplicates:** every origin remote found in more than one place is listed, tagged `(linked worktree)` when the checkouts share
+  one `.git` directory, and flagged when several separate `.git` checkouts point at the same origin. That is the untracked-copy
+  problem the brain protocol forbids, surfaced for you to resolve.
+- **Read only:** it never pulls, checks out, prunes, or deletes. `fetch=true` is the only call that touches a remote. Suggested
+  next steps (`pull --ff-only`, prune a merged worktree) are printed as hints for you to run.
+- Large reports are truncated in the transcript and the full text is saved to a temp file whose path is printed.
+
 ## License
 
 MIT
