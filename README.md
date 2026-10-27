@@ -2,6 +2,12 @@
 
 Four extensions for the [pi coding agent](https://pi.dev).
 
+## Platform support
+
+`context-awareness`, `search`, and `repo-state` run on macOS, Linux, and Windows. Search uses ripgrep
+when available and otherwise falls back to a built-in Node.js implementation, so Windows does not
+need `grep` or `find`. The `computer-use` and `ios-simulator` tools register only on macOS.
+
 ## Install
 
 ```bash
@@ -94,6 +100,15 @@ cheap porcelain commands (`git status --porcelain=v2 -b`, `git log -1`, `git wor
 - **Read only:** it never pulls, checks out, prunes, or deletes. `fetch=true` is the only call that touches a remote. Suggested
   next steps (`pull --ff-only`, prune a merged worktree) are printed as hints for you to run.
 - Large reports are truncated in the transcript and the full text is saved to a temp file whose path is printed.
+
+## gemini-rate-limiter
+
+When a Gemini model is active, Pi's normal agent loop can easily exceed Google AI Studio's mid-tier token and request rate limits. This extension slows the harness down just enough to keep it compliant.
+
+- Injects a **6-second delay** after every tool execution if the active model is from the `google` provider or contains `gemini` in its ID.
+- Naturally caps the loop at ~10 requests per minute (RPM).
+- Logs a subtle info notification in the UI when the delay is enforced.
+- Cross-platform: works on macOS, Linux, and Windows.
 
 ## License
 
