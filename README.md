@@ -27,8 +27,9 @@ full its context window is on every request, and lets it compact itself at a sen
 
 - **A context note on every model request**, including each step of a multi-tool run: tokens used,
   window size, percent, and the distance to Pi's auto-compaction (read from your compaction settings,
-  including per-model overrides). The note is added only to the request and never saved to the session,
-  so it does not fill the transcript or break prompt caching.
+  including per-model overrides). Changed notes are saved in session history before a run and after
+  tool steps. Earlier notes stay unchanged, preserving the prompt prefix for caching, including through
+  pi-claude-bridge. Duplicate notes are skipped, and notes never start an extra model reply.
 - **Compaction thresholds.** At 75%, the note prepares for compaction with targeted reads and saved
   findings. At 80%, it requires immediate compaction before another tool call, even when the current
   task is unfinished. This leaves enough context for the model to summarize the session reliably.
