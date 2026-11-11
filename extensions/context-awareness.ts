@@ -2,12 +2,12 @@
  * Context awareness - tell the model how full its context window is on every request.
  *
  * Pi shows context usage in the footer, but the model never sees it. This appends one
- * short note to the end of every model request, including each step of a multi-tool
- * run, with the same usage figure the footer shows and the distance to auto-compaction.
+ * short note before a run and after each tool step, with the same usage figure the
+ * footer shows and the distance to auto-compaction.
  *
- * The note is added in the `context` event, which is request-local: it is never written
- * to the session, so it does not pile up in the transcript or get summarized at
- * compaction. Appending at the end keeps the cached prompt prefix intact.
+ * Changed notes are saved with pi.sendMessage, so earlier notes remain unchanged in
+ * session history and later requests retain the cached prompt prefix. They never
+ * trigger an additional model reply or split a tool call from its result.
  *
  * Also registers `context_status` so the model can check on demand, and a `/context-note`
  * command that shows the note the model would see next.
@@ -188,13 +188,26 @@ function startCompaction(pi: ExtensionAPI, ctx: ExtensionContext, keep: string, 
 }
 
 export default function contextAwareness(pi: ExtensionAPI): void {
+	let lastNote: string | null = null;
+	const resetNote = () => { lastNote = null; };
+	const saveNote = (ctx: ExtensionContext) => {
+		const note = buildNote(ctx);
+		if (!note || note === lastNote) return;
+		pi.sendMessage({ customType: "context-awareness", content: note, display: false }, { triggerTurn: false });
+		lastNote = note;
+	};
+
 	// Guards are per session; a new or switched session starts clean.
 	pi.on("session_start", async () => {
+		resetNote();
 		compacting = false;
 		pendingCompaction = null;
 		autoResumes = 0;
 		percentAfterLastCompaction = null;
 	});
+	pi.on("session_tree", resetNote);
+	pi.on("session_compact", resetNote);
+	pi.on("model_select", resetNote);
 
 	// A model-called tool executes while Pi is busy. Defer ctx.compact() until this idle-safe
 	// lifecycle boundary; returning continue: false lets compaction run instead of starting another
@@ -208,15 +221,13 @@ export default function contextAwareness(pi: ExtensionAPI): void {
 		return { continue: false };
 	});
 
-	pi.on("context", async (event, ctx) => {
-		const note = buildNote(ctx);
-		if (!note) return;
-		return {
-			messages: [
-				...event.messages,
-				{ role: "custom", customType: "context-awareness", content: note, display: false, timestamp: Date.now() },
-			],
-		};
+	pi.on("before_agent_start", (_event, ctx) => saveNote(ctx));
+	pi.on("turn_end", (event, ctx) => {
+		// Final answers and failed runs must settle normally. Pi persists this message
+		// after all tool results, making it available to the next natural request.
+		if (compacting || event.toolResults.length === 0 || event.message.role !== "assistant" ||
+			event.message.stopReason === "error" || event.message.stopReason === "aborted") return;
+		saveNote(ctx);
 	});
 
 	pi.registerTool({
